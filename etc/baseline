@@ -1,0 +1,9 @@
+service:httpd:enabled:running
+selinux:mode:enforcing
+file:/etc/httpd/conf/httpd.conf:root:root:644:httpd_config_t
+dir:/var/www/html:root:root:755:httpd_sys_content_t
+firewall:service:http
+firewall:service:ssh
+health:httpd:curl -sf -m 2 http://localhost/
+service:sshd:enabled:running
+file:/etc/hosts:root:root:644:net_conf_t

@@ -1,0 +1,8 @@
+[Unit]
+Description=rewind drift check every 5s
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5s
+AccuracySec=1s
+[Install]
+WantedBy=timers.target

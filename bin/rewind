@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -euo pipefail
+. /usr/local/lib/rewind/lib.sh
+WHO="${SUDO_USER:-root}"
+
+usage() { cat >&2 <<'U'
+usage:
+  rewind <command...>                    snapshot, run, health-check, auto-revert on failure
+  rewind trial --for <dur> <command...>  apply now, auto-revert after <dur> unless confirmed
+  rewind confirm                         keep the pending trial change
+  rewind commit                          accept current state as the new baseline
+  rewind snapshot|check|restore [id]
+  rewind log [n]                         unified timeline (operator + autonomous)
+U
+exit 2; }
+
+cmd_run() {
+  [[ $# -gt 0 ]] || usage
+  local id="tx-$(date +%s)"
+  exec 9>"$LOCK_FILE"; flock 9; trap 'flock -u 9' EXIT     # daemon stays out while we work
+  snapshot "$id"
+  timeline TX "$id" START "$WHO: $*"
+  set +e; "$@"; local rc=$?; set -e
+  if [[ $rc -eq 0 ]] && health_ok 10; then
+    snapshot baseline                                       # commit = new known-good
+    timeline TX "$id" COMMIT "$WHO: $* (exit 0, health ok)"
+  else
+    timeline TX "$id" REVERT "$WHO: $* (exit $rc, health failed)"
+    restore "$id" || true
+    timeline TX "$id" REVERTED "back at pre-change state"
+    exit 1
+  fi
+}
+
+cmd_trial() {
+  local dur=5m
+  if [[ ${1:-} == --for ]]; then dur=$2; shift 2; fi
+  [[ $# -gt 0 ]] || usage
+  [[ -f $PENDING ]] && die "trial $(cat "$PENDING") already pending — 'rewind confirm' first"
+  local id="tx-$(date +%s)"
+  snapshot "$id"
+  echo "$id" > "$PENDING"                                   # suppresses daemon until resolved
+  timeline TRIAL "$id" START "$WHO: $* (auto-revert in $dur)"
+  set +e; "$@"; set -e
+  systemd-run --quiet --on-active="$dur" --unit="rewind-trial-$id" \
+    --description="rewind trial $id auto-revert" /usr/local/bin/rewind _expire "$id"
+  log "applied. reverts in $dur unless you run: rewind confirm"
+}
+
+cmd_confirm() {
+  [[ -f $PENDING ]] || die "no pending trial"
+  local id; id=$(cat "$PENDING")
+  systemctl stop "rewind-trial-$id.timer" 2>/dev/null || true
+  snapshot baseline
+  rm -f "$PENDING"
+  timeline TRIAL "$id" CONFIRM "$WHO confirmed; committed as baseline"
+}
+
+cmd_expire() {
+  local id=$1
+  if [[ ! -f $PENDING || $(cat "$PENDING") != "$id" ]]; then log "trial $id already resolved"; exit 0; fi
+  timeline TRIAL "$id" EXPIRED "no confirmation received"
+  restore "$id" || true
+  rm -f "$PENDING"
+  timeline TRIAL "$id" REVERTED "back at pre-change state"
+}
+
+cmd_drift() {   # called by rewind-drift.timer
+  if [[ -f $PENDING ]]; then exit 0; fi                     # trial in flight
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then exit 0; fi                          # transaction in flight
+  [[ -d $REWIND_ROOT/baseline ]] || exit 0
+  local reasons n
+  if reasons=$(check baseline 2>&1); then echo 0 > "$STRIKES_FILE"; exit 0; fi
+  n=$(( $(cat "$STRIKES_FILE" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STRIKES_FILE"
+  if (( n < REWIND_STRIKES )); then log "drift observed ($n/$REWIND_STRIKES), waiting for confirmation"; exit 0; fi
+  local id="drift-$(date +%s)"
+  timeline DRIFT "$id" DETECTED "$(echo "$reasons" | sed 's/^rewind: CHECK FAIL //' | tr '\n' ';')"
+  restore baseline || true
+  echo 0 > "$STRIKES_FILE"
+  timeline DRIFT "$id" CORRECTED "restored baseline"
+}
+
+cmd_log() {
+  [[ -f $TIMELINE ]] || { echo "(timeline empty)"; exit 0; }
+  awk -F'\t' '{ printf "%-25s %-6s %-16s %-9s %s\n", $1, $2, $3, $4, $5 }' "$TIMELINE" | tail -n "${1:-30}"
+}
+
+. /usr/local/lib/rewind/drift.sh
+. /usr/local/lib/rewind/ui.sh
+case ${1:-} in
+  snapshot) shift; snapshot "${1:-baseline}" ;;
+  check)    shift; check "${1:-baseline}" && echo "OK: system matches ${1:-baseline}" ;;
+  restore)  shift; restore "${1:-baseline}" ;;
+  commit)   snapshot baseline; timeline TX baseline COMMIT "$WHO accepted current state" ;;
+  status)   cmd_status ;;
+  why)      shift; cmd_why "$@" ;;
+  log)      shift; cmd_log "${1:-30}" ;;
+  trial)    shift; cmd_trial "$@" ;;
+  confirm)  cmd_confirm ;;
+  _expire)  shift; cmd_expire "$1" ;;
+  _drift)   cmd_drift ;;
+  ""|-h|--help) usage ;;
+  *)        cmd_run "$@" ;;
+esac
